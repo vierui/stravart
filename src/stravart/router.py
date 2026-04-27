@@ -101,11 +101,58 @@ def _path_to_coords(
     G: nx.MultiDiGraph, path_nodes: list[int]
 ) -> tuple[list[float], list[float]]:
     import pyproj
+
     crs = G.graph["crs"]
     transformer = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-    xs = [G.nodes[n]["x"] for n in path_nodes]
-    ys = [G.nodes[n]["y"] for n in path_nodes]
-    lons, lats = transformer.transform(xs, ys)
+
+    if len(path_nodes) < 2:
+        if path_nodes:
+            x, y = G.nodes[path_nodes[0]]["x"], G.nodes[path_nodes[0]]["y"]
+            lon, lat = transformer.transform(x, y)
+            return [float(lat)], [float(lon)]
+        return [], []
+
+    all_xs: list[float] = []
+    all_ys: list[float] = []
+
+    for i in range(len(path_nodes) - 1):
+        u, v = path_nodes[i], path_nodes[i + 1]
+        edge_data = G.get_edge_data(u, v)
+
+        if edge_data:
+            best_key = min(
+                edge_data, key=lambda k: edge_data[k].get("length", float("inf"))
+            )
+            geom = edge_data[best_key].get("geometry")
+
+            if geom is not None:
+                coords = list(geom.coords)
+                u_pos = (G.nodes[u]["x"], G.nodes[u]["y"])
+                d_first = (coords[0][0] - u_pos[0]) ** 2 + (
+                    coords[0][1] - u_pos[1]
+                ) ** 2
+                d_last = (coords[-1][0] - u_pos[0]) ** 2 + (
+                    coords[-1][1] - u_pos[1]
+                ) ** 2
+                if d_last < d_first:
+                    coords = coords[::-1]
+                xs = [c[0] for c in coords]
+                ys = [c[1] for c in coords]
+            else:
+                xs = [G.nodes[u]["x"], G.nodes[v]["x"]]
+                ys = [G.nodes[u]["y"], G.nodes[v]["y"]]
+        else:
+            xs = [G.nodes[u]["x"], G.nodes[v]["x"]]
+            ys = [G.nodes[u]["y"], G.nodes[v]["y"]]
+
+        if all_xs:
+            xs = xs[1:]
+            ys = ys[1:]
+
+        all_xs.extend(xs)
+        all_ys.extend(ys)
+
+    lons, lats = transformer.transform(all_xs, all_ys)
     return list(lats), list(lons)
 
 
