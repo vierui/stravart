@@ -16,6 +16,13 @@ class Route:
     lat: NDArray[np.float64]
     lon: NDArray[np.float64]
     total_distance_m: float
+    skipped_segments: int = 0
+
+
+@dataclass
+class SnapResult:
+    node_ids: NDArray[np.int64]
+    distances_m: NDArray[np.float64]
 
 
 def load_graph(
@@ -26,28 +33,45 @@ def load_graph(
         dist=radius_m,
         network_type="walk",
     )
-    # Project to UTM so nearest_nodes works without scikit-learn
     return ox.project_graph(G)
 
 
 def snap_to_graph(
     G: nx.MultiDiGraph, geo_points: GeoPoints
-) -> NDArray[np.int64]:
-    # Project lat/lon to the graph's CRS (UTM) for snapping
+) -> SnapResult:
     xs, ys = _project_coords(G, geo_points.lon, geo_points.lat)
     node_ids = ox.distance.nearest_nodes(G, X=xs, Y=ys)
-    return np.array(node_ids, dtype=np.int64)
+    node_ids_arr = np.array(node_ids, dtype=np.int64)
+
+    node_xs = np.array([G.nodes[int(n)]["x"] for n in node_ids_arr])
+    node_ys = np.array([G.nodes[int(n)]["y"] for n in node_ids_arr])
+    dists = np.sqrt((xs - node_xs) ** 2 + (ys - node_ys) ** 2)
+
+    return SnapResult(node_ids=node_ids_arr, distances_m=dists)
 
 
-def _project_coords(
-    G: nx.MultiDiGraph, lons: NDArray, lats: NDArray
-) -> tuple[NDArray, NDArray]:
-    """Project WGS84 lon/lat arrays to the graph's projected CRS."""
-    import pyproj
-    crs = G.graph["crs"]
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-    xs, ys = transformer.transform(lons, lats)
-    return np.array(xs), np.array(ys)
+def filter_graph_to_corridor(
+    G: nx.MultiDiGraph, geo_points: GeoPoints, buffer_m: float
+) -> nx.MultiDiGraph:
+    from shapely.geometry import LineString
+
+    shape_xs, shape_ys = _project_coords(G, geo_points.lon, geo_points.lat)
+    coords = list(zip(shape_xs.tolist(), shape_ys.tolist()))
+    coords.append(coords[0])
+    ideal_line = LineString(coords)
+    corridor = ideal_line.buffer(buffer_m)
+
+    keep_edges = []
+    for u, v, k, data in G.edges(keys=True, data=True):
+        geom = data.get("geometry")
+        if geom is None:
+            p1 = (G.nodes[u]["x"], G.nodes[u]["y"])
+            p2 = (G.nodes[v]["x"], G.nodes[v]["y"])
+            geom = LineString([p1, p2])
+        if geom.intersects(corridor):
+            keep_edges.append((u, v, k))
+
+    return G.edge_subgraph(keep_edges).copy()
 
 
 def compute_route(
@@ -60,6 +84,7 @@ def compute_route(
     all_lats: list[float] = []
     all_lons: list[float] = []
     total_dist = 0.0
+    skipped = 0
 
     for i in range(len(nodes_seq) - 1):
         orig, dest = int(nodes_seq[i]), int(nodes_seq[i + 1])
@@ -69,12 +94,12 @@ def compute_route(
             path = nx.shortest_path(G, orig, dest, weight="length")
         except nx.NetworkXNoPath:
             warnings.warn(f"No path between nodes {orig} -> {dest}, skipping segment")
+            skipped += 1
             continue
 
         lats, lons = _path_to_coords(G, path)
         dist = _path_distance(G, path)
 
-        # Avoid duplicating the junction node
         if all_lats and lats:
             lats = lats[1:]
             lons = lons[1:]
@@ -87,7 +112,20 @@ def compute_route(
         lat=np.array(all_lats),
         lon=np.array(all_lons),
         total_distance_m=total_dist,
+        skipped_segments=skipped,
     )
+
+
+def _project_coords(
+    G: nx.MultiDiGraph, lons: NDArray, lats: NDArray
+) -> tuple[NDArray, NDArray]:
+    """Project WGS84 lon/lat arrays to the graph's projected CRS."""
+    import pyproj
+
+    crs = G.graph["crs"]
+    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    xs, ys = transformer.transform(lons, lats)
+    return np.array(xs), np.array(ys)
 
 
 def _deduplicate_consecutive(nodes: NDArray[np.int64]) -> NDArray[np.int64]:

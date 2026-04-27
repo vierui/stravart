@@ -41,8 +41,8 @@ def main() -> None:
     parser.add_argument(
         "--points",
         type=int,
-        default=50,
-        help="Number of shape sample points (default: 50)",
+        default=120,
+        help="Number of shape sample points (default: 120)",
     )
 
     args = parser.parse_args()
