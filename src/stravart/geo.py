@@ -45,7 +45,7 @@ def shape_to_geo(
 
 
 def estimate_initial_scale(
-    shape: ShapePoints, target_distance_m: float, overhead_factor: float = 2.0
+    shape: ShapePoints, target_distance_m: float, overhead_factor: float = 1.5
 ) -> float:
     perimeter = shape.perimeter
     if perimeter == 0:

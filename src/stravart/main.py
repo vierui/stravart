@@ -22,8 +22,7 @@ def generate_route(
     shape = generate_shape(shape_name, num_points)
     initial_scale = estimate_initial_scale(shape, target_m)
 
-    # Load graph once with generous radius
-    graph_radius = initial_scale * 2.5
+    graph_radius = max(initial_scale * 4.0, 2500)
     print(f"Downloading walk network ({graph_radius:.0f}m radius)...")
     G = load_graph(center_lat, center_lon, graph_radius)
     print(f"Graph: {len(G.nodes)} nodes, {len(G.edges)} edges")
