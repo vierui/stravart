@@ -18,5 +18,8 @@ output/
 *.gpx
 *.html
 
+# OSMnx cache
+cache/
+
 # OS
 .DS_Store
