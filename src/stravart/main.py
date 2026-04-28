@@ -90,8 +90,9 @@ def generate_route(
     assert best_geo is not None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    gpx_path = output_dir / f"{shape_name}_route.gpx"
-    map_path = output_dir / f"{shape_name}_route.html"
+    basename = f"{shape_name}_{target_distance_km}km_{center_lat}_{center_lon}"
+    gpx_path = output_dir / f"{basename}.gpx"
+    map_path = output_dir / f"{basename}.html"
 
     route_to_gpx(best_route, gpx_path)
     route_to_map(best_route, best_geo, map_path)
