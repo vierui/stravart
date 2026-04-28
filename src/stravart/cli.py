@@ -21,7 +21,7 @@ def main() -> None:
         help="Shape to trace (default: heart)",
     )
     parser.add_argument(
-        "--distance",
+        "--km",
         type=float,
         default=5.0,
         help="Target route distance in km (default: 5.0)",
@@ -51,14 +51,14 @@ def main() -> None:
 
     print(f"stravart: generating {args.shape} route")
     print(f"  center: ({args.lat}, {args.lon})")
-    print(f"  target: {args.distance} km")
+    print(f"  target: {args.km} km")
     print()
 
     result = generate_route(
         center_lat=args.lat,
         center_lon=args.lon,
         shape_name=args.shape,
-        target_distance_km=args.distance,
+        target_distance_km=args.km,
         rotation_deg=args.rotation,
         num_points=args.points,
         output_dir=Path(args.output),
