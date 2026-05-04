@@ -8,9 +8,11 @@ from stravart.export import route_to_gpx, route_to_map
 from stravart.geo import GeoPoints, estimate_initial_scale, shape_to_geo
 from stravart.router import (
     Route,
+    apply_affinity_weights,
     compute_route,
     filter_graph_to_corridor,
     load_graph,
+    prune_dead_ends,
     snap_to_graph,
 )
 from stravart.shapes import generate_shape
@@ -22,7 +24,7 @@ def generate_route(
     shape_name: str,
     target_distance_km: float,
     rotation_deg: float = 0.0,
-    num_points: int = 120,
+    num_points: int = 50,
     output_dir: Path = Path("output"),
 ) -> dict:
     target_m = target_distance_km * 1000
@@ -34,6 +36,12 @@ def generate_route(
     print(f"Downloading walk network ({graph_radius:.0f}m radius)...")
     G = load_graph(center_lat, center_lon, graph_radius)
     print(f"Graph: {len(G.nodes)} nodes, {len(G.edges)} edges")
+
+    if len(G.nodes) < 10:
+        raise RuntimeError(
+            f"Too few walkable roads near ({center_lat}, {center_lon}). "
+            "Check that --lat and --lon are correct (lat first, lon second)."
+        )
 
     scale = initial_scale
     best_route: Route | None = None
@@ -47,10 +55,14 @@ def generate_route(
         snap = None
         used_buffer = "full"
 
-        for buffer_m in [150, 250, 400, 700]:
+        for buffer_m in [300, 500, 800]:
             G_corridor = filter_graph_to_corridor(G, geo, buffer_m)
+            G_corridor = prune_dead_ends(G_corridor)
+            if len(G_corridor.nodes) == 0:
+                continue
+            apply_affinity_weights(G_corridor, geo)
             snap = snap_to_graph(G_corridor, geo)
-            candidate = compute_route(G_corridor, snap.node_ids)
+            candidate = compute_route(G_corridor, snap.node_ids, weight="affinity")
 
             if candidate.skipped_segments == 0 and candidate.total_distance_m > 0:
                 route = candidate
@@ -58,8 +70,9 @@ def generate_route(
                 break
 
         if route is None:
-            snap = snap_to_graph(G, geo)
-            route = compute_route(G, snap.node_ids)
+            G_pruned = prune_dead_ends(G)
+            snap = snap_to_graph(G_pruned, geo)
+            route = compute_route(G_pruned, snap.node_ids)
 
         unique = len(np.unique(snap.node_ids))
         ratio = route.total_distance_m / target_m if target_m > 0 else 1.0
