@@ -7,6 +7,7 @@ import networkx as nx
 import numpy as np
 import osmnx as ox
 from numpy.typing import NDArray
+from scipy.spatial import cKDTree
 
 from stravart.geo import GeoPoints
 
@@ -36,18 +37,58 @@ def load_graph(
     return ox.project_graph(G)
 
 
+def prune_dead_ends(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Iteratively remove dead-end nodes (undirected degree <= 1)."""
+    G = G.copy()
+    while True:
+        G_undir = G.to_undirected()
+        dead = [n for n in G_undir.nodes() if G_undir.degree(n) <= 1]
+        if not dead:
+            break
+        G.remove_nodes_from(dead)
+    return G
+
+
 def snap_to_graph(
-    G: nx.MultiDiGraph, geo_points: GeoPoints
+    G: nx.MultiDiGraph, geo_points: GeoPoints, prefer_intersections: bool = True
 ) -> SnapResult:
     xs, ys = _project_coords(G, geo_points.lon, geo_points.lat)
-    node_ids = ox.distance.nearest_nodes(G, X=xs, Y=ys)
-    node_ids_arr = np.array(node_ids, dtype=np.int64)
+    node_ids_list = list(G.nodes())
+    node_xs = np.array([G.nodes[n]["x"] for n in node_ids_list])
+    node_ys = np.array([G.nodes[n]["y"] for n in node_ids_list])
+    tree = cKDTree(np.column_stack([node_xs, node_ys]))
+    query_pts = np.column_stack([xs, ys])
 
-    node_xs = np.array([G.nodes[int(n)]["x"] for n in node_ids_arr])
-    node_ys = np.array([G.nodes[int(n)]["y"] for n in node_ids_arr])
-    dists = np.sqrt((xs - node_xs) ** 2 + (ys - node_ys) ** 2)
+    if prefer_intersections and len(node_ids_list) > 1:
+        G_undir = G.to_undirected()
+        degrees = np.array([G_undir.degree(n) for n in node_ids_list])
+        k = min(10, len(node_ids_list))
+        dists_k, idxs_k = tree.query(query_pts, k=k)
+        if k == 1:
+            dists_k = dists_k.reshape(-1, 1)
+            idxs_k = idxs_k.reshape(-1, 1)
 
-    return SnapResult(node_ids=node_ids_arr, distances_m=dists)
+        chosen_ids = np.empty(len(xs), dtype=np.int64)
+        chosen_dists = np.empty(len(xs))
+        for i in range(len(xs)):
+            nearest_dist = dists_k[i, 0]
+            best_idx = idxs_k[i, 0]
+            # Pick closest intersection (degree >= 3) within 2x nearest distance
+            for j in range(k):
+                idx = idxs_k[i, j]
+                if dists_k[i, j] > nearest_dist * 2.0:
+                    break
+                if degrees[idx] >= 3:
+                    best_idx = idx
+                    break
+            chosen_ids[i] = node_ids_list[best_idx]
+            chosen_dists[i] = dists_k[i, list(idxs_k[i]).index(best_idx)]
+    else:
+        dists_q, idxs_q = tree.query(query_pts)
+        chosen_ids = np.array([node_ids_list[i] for i in idxs_q], dtype=np.int64)
+        chosen_dists = dists_q
+
+    return SnapResult(node_ids=chosen_ids, distances_m=chosen_dists)
 
 
 def filter_graph_to_corridor(
@@ -74,15 +115,42 @@ def filter_graph_to_corridor(
     return G.edge_subgraph(keep_edges).copy()
 
 
+def apply_affinity_weights(
+    G: nx.MultiDiGraph, geo_points: GeoPoints, alpha: float = 5.0
+) -> None:
+    """Add 'affinity' weight to edges: penalizes edges far from the ideal shape outline."""
+    from shapely.geometry import LineString, Point
+
+    shape_xs, shape_ys = _project_coords(G, geo_points.lon, geo_points.lat)
+    coords = list(zip(shape_xs.tolist(), shape_ys.tolist()))
+    coords.append(coords[0])
+    ideal_line = LineString(coords)
+    ref_dist = ideal_line.length / 20.0
+
+    for u, v, k, data in G.edges(keys=True, data=True):
+        length = data.get("length", 1.0)
+        geom = data.get("geometry")
+        if geom is not None:
+            midpoint = geom.interpolate(0.5, normalized=True)
+        else:
+            mid_x = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
+            mid_y = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
+            midpoint = Point(mid_x, mid_y)
+        dist_to_shape = ideal_line.distance(midpoint)
+        data["affinity"] = length * (1.0 + alpha * dist_to_shape / ref_dist)
+
+
 def compute_route(
-    G: nx.MultiDiGraph, snapped_nodes: NDArray[np.int64], close_loop: bool = True
+    G: nx.MultiDiGraph,
+    snapped_nodes: NDArray[np.int64],
+    close_loop: bool = True,
+    weight: str = "length",
 ) -> Route:
     nodes_seq = _deduplicate_consecutive(snapped_nodes)
     if close_loop and len(nodes_seq) > 1 and nodes_seq[0] != nodes_seq[-1]:
         nodes_seq = np.append(nodes_seq, nodes_seq[0])
 
-    all_lats: list[float] = []
-    all_lons: list[float] = []
+    all_path_nodes: list[int] = []
     total_dist = 0.0
     skipped = 0
 
@@ -91,22 +159,28 @@ def compute_route(
         if orig == dest:
             continue
         try:
-            path = nx.shortest_path(G, orig, dest, weight="length")
+            path = nx.shortest_path(G, orig, dest, weight=weight)
         except nx.NetworkXNoPath:
             warnings.warn(f"No path between nodes {orig} -> {dest}, skipping segment")
             skipped += 1
             continue
 
-        lats, lons = _path_to_coords(G, path)
         dist = _path_distance(G, path)
 
-        if all_lats and lats:
-            lats = lats[1:]
-            lons = lons[1:]
+        if all_path_nodes and path:
+            path = path[1:]
 
-        all_lats.extend(lats)
-        all_lons.extend(lons)
+        all_path_nodes.extend(path)
         total_dist += dist
+
+    # Remove out-and-back spurs: shortcut when a node is revisited within a window
+    all_path_nodes = _remove_spurs(all_path_nodes)
+    total_dist = _path_distance(G, all_path_nodes)
+
+    all_lats: list[float] = []
+    all_lons: list[float] = []
+    if all_path_nodes:
+        all_lats, all_lons = _path_to_coords(G, all_path_nodes)
 
     return Route(
         lat=np.array(all_lats),
@@ -114,6 +188,29 @@ def compute_route(
         total_distance_m=total_dist,
         skipped_segments=skipped,
     )
+
+
+def _remove_spurs(path_nodes: list[int], max_spur_nodes: int = 40) -> list[int]:
+    """Remove out-and-back spurs by shortcutting revisited nodes.
+
+    When a node appears twice within a window of max_spur_nodes,
+    the segment between is an out-and-back spur — remove it.
+    """
+    result = list(path_nodes)
+    changed = True
+    while changed:
+        changed = False
+        seen: dict[int, int] = {}
+        for i, node in enumerate(result):
+            if node in seen:
+                prev_i = seen[node]
+                gap = i - prev_i
+                if 0 < gap <= max_spur_nodes:
+                    result = result[:prev_i] + result[i:]
+                    changed = True
+                    break
+            seen[node] = i
+    return result
 
 
 def _project_coords(
